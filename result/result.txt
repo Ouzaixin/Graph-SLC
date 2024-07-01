@@ -1,0 +1,4 @@
+This folder stores 
+1: the checkpoint files of models;
+2: the loss log files during training stage;
+3: the indicator files (i.e., validation.csv and test.csv).
