@@ -1,0 +1,8 @@
+File containing the links to two datasets.
+- ADNI (https://adni.loni.usc.edu/data-samples/access-data/)
+
+This folder should contain three sub-folders:
+1: whole_MRI (containing MR images);
+2: whole_FDG (containing FDG-PET images);
+3: whole_Abeta (containing Abeta-PET images);
+4: whole_Tau (containing Tau-PET images);
