@@ -1,15 +1,15 @@
-import config
 import math
-import numpy as np
 import torch
-from torch import nn, einsum
+from torch import nn
+import numpy as np
+import config
 
 def xavier_init(fan_in, fan_out, constant=1):
     low = -constant * np.sqrt(6.0 / (fan_in + fan_out))
     high = constant * np.sqrt(6.0 / (fan_in + fan_out))
     a = np.random.uniform(low,high,(fan_in,fan_out))
     a = a.astype('float32')
-    a = torch.from_numpy(a)
+    a = torch.from_numpy(a).cuda()
     return a
 
 class Swish(nn.Module):
@@ -82,6 +82,32 @@ class SelfAttention(nn.Module):
 
         return out + input
 
+class CrossAttention(nn.Module):
+    def __init__(self, x_channel, y_channel, n_head=1, norm_groups=16):
+        super().__init__()
+
+        self.n_head = n_head
+        self.norm = nn.GroupNorm(norm_groups, x_channel)
+        self.q = nn.Linear(x_channel, y_channel)
+        self.k = nn.Linear(y_channel, y_channel)
+        self.v = nn.Linear(y_channel, y_channel)
+        self.out = nn.Linear(y_channel, x_channel)
+
+    def forward(self, input, y):
+        b, n, H, W, D = input.shape
+        x = self.norm(input)
+        x = x.reshape(b, n, H*W*D).permute(0, 2, 1)
+        q = self.q(x)
+        k = self.k(y)
+        v = self.v(y)
+
+        attn = torch.matmul(q,k.T) / math.sqrt(n)
+        attn = torch.softmax(attn, -1)
+        out = torch.matmul(attn, v)
+        out = self.out(out)
+        out = out.permute(0, 2, 1).reshape(b, n, H, W, D)
+        return out
+
 class ResnetBlocWithAttn(nn.Module):
     def __init__(self, dim, dim_out, norm_groups=16, dropout=0, with_attn=False):
         super().__init__()
@@ -106,71 +132,36 @@ class Reconstruction(nn.Module):
     ):
         super().__init__()
 
-        # share layers
-        shared_layer = []
-        shared_layer.append(nn.Conv3d(in_channel, inner_channel[0], kernel_size=3, padding=1))
-        shared_layer.append(Upsample(inner_channel[0], inner_channel[0]))
-        shared_layer.append(ResnetBlocWithAttn(inner_channel[0], inner_channel[0], norm_groups=norm_groups, dropout=dropout, with_attn=True))
-        shared_layer.append(Upsample(inner_channel[0], inner_channel[1]))
-        shared_layer.append(ResnetBlocWithAttn(inner_channel[1], inner_channel[1], norm_groups=norm_groups, dropout=dropout, with_attn=True))
+        shared_layer = [
+            nn.Conv3d(in_channel, inner_channel[0], kernel_size=3, padding=1),
+            Upsample(inner_channel[0], inner_channel[0]),
+            ResnetBlocWithAttn(inner_channel[0], inner_channel[1], norm_groups=norm_groups, dropout=dropout, with_attn=True),
+            Upsample(inner_channel[1], inner_channel[1]),
+            ResnetBlocWithAttn(inner_channel[1], inner_channel[2], norm_groups=norm_groups, dropout=dropout, with_attn=True),
+        ]
 
-        # specific layers
-        # MRI
-        specific_layer_MRI = []
-        specific_layer_MRI.append(Upsample(inner_channel[1], inner_channel[2]))
-        specific_layer_MRI.append(ResnetBlocWithAttn(inner_channel[2], inner_channel[2], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_MRI.append(Upsample(inner_channel[2], inner_channel[3]))
-        specific_layer_MRI.append(ResnetBlocWithAttn(inner_channel[3], inner_channel[3], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_MRI.append(nn.Conv3d(inner_channel[3], out_channel, kernel_size=3, padding=1))
+        def create_specific_layers():
+            return nn.Sequential(
+                Upsample(inner_channel[2], inner_channel[2]),
+                ResnetBlocWithAttn(inner_channel[2], inner_channel[3], norm_groups=norm_groups, dropout=dropout, with_attn=False),
+                Upsample(inner_channel[3], inner_channel[3]),
+                ResnetBlocWithAttn(inner_channel[3], inner_channel[3], norm_groups=norm_groups, dropout=dropout, with_attn=False),
+                nn.Conv3d(inner_channel[3], out_channel, 3, 1, 1)
+            )
 
-        # FDG
-        specific_layer_FDG = []
-        specific_layer_FDG.append(Upsample(inner_channel[1], inner_channel[2]))
-        specific_layer_FDG.append(ResnetBlocWithAttn(inner_channel[2], inner_channel[2], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_FDG.append(Upsample(inner_channel[2], inner_channel[3]))
-        specific_layer_FDG.append(ResnetBlocWithAttn(inner_channel[3], inner_channel[3], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_FDG.append(nn.Conv3d(inner_channel[3], out_channel, kernel_size=3, padding=1))
-
-        # Aβ
-        specific_layer_AV45 = []
-        specific_layer_AV45.append(Upsample(inner_channel[1], inner_channel[2]))
-        specific_layer_AV45.append(ResnetBlocWithAttn(inner_channel[2], inner_channel[2], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_AV45.append(Upsample(inner_channel[2], inner_channel[3]))
-        specific_layer_AV45.append(ResnetBlocWithAttn(inner_channel[3], inner_channel[3], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_AV45.append(nn.Conv3d(inner_channel[3], out_channel, kernel_size=3, padding=1))
-
-        # Tau
-        specific_layer_Tau = []
-        specific_layer_Tau.append(Upsample(inner_channel[1], inner_channel[2]))
-        specific_layer_Tau.append(ResnetBlocWithAttn(inner_channel[2], inner_channel[2], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_Tau.append(Upsample(inner_channel[2], inner_channel[3]))
-        specific_layer_Tau.append(ResnetBlocWithAttn(inner_channel[3], inner_channel[3], norm_groups=norm_groups, dropout=dropout, with_attn=False))
-        specific_layer_Tau.append(nn.Conv3d(inner_channel[3], out_channel, kernel_size=3, padding=1))
-
-        self.shared_part = nn.ModuleList(shared_layer)
-        self.specific_layer_MRI = nn.ModuleList(specific_layer_MRI)
-        self.specific_layer_FDG = nn.ModuleList(specific_layer_FDG)
-        self.specific_layer_AV45 = nn.ModuleList(specific_layer_AV45)
-        self.specific_layer_Tau = nn.ModuleList(specific_layer_Tau)
+        self.shared_part = nn.Sequential(*shared_layer)
+        self.specific_layer_MRI = create_specific_layers()
+        self.specific_layer_FDG = create_specific_layers()
+        self.specific_layer_AV45 = create_specific_layers()
+        self.specific_layer_Tau = create_specific_layers()
 
     def forward(self, x):
         x = x.reshape(config.batch_size, 1, 12, 12, 12).to(config.device)
-        for layer in self.shared_part:
-            x = layer(x)
+        x = self.shared_part(x)
         
-        rec_MRI = x.copy()
-        for layer in self.specific_layer_MRI:
-            rec_MRI = layer(rec_MRI)
-        
-        rec_FDG = x.copy()
-        for layer in self.specific_layer_FDG:
-            rec_FDG = layer(rec_FDG)
+        rec_MRI = self.specific_layer_MRI(x)
+        rec_FDG = self.specific_layer_FDG(x)
+        rec_AV45 = self.specific_layer_AV45(x)
+        rec_Tau = self.specific_layer_Tau(x)
 
-        rec_AV45 = x.copy()
-        for layer in self.specific_layer_MRI:
-            rec_AV45 = layer(rec_AV45)
-        
-        rec_Tau = x.copy()
-        for layer in self.specific_layer_FDG:
-            rec_Tau = layer(rec_Tau)
         return rec_MRI, rec_FDG, rec_AV45, rec_Tau
